@@ -1,0 +1,157 @@
+# GA Code Verify iRule
+when ACCESS_POLICY_AGENT_EVENT {
+
+    if { [ACCESS::policy agent_id] eq "ga_code_verify" } {
+        ### Google Authenticator verification settings ###
+
+        # lock the user out after x attempts for a period of x seconds
+        set static::lockout_attempts 3
+        set static::lockout_period 30
+
+        # logon page session variable name for code attempt form field
+        set static::ga_code_form_field "ga_code_attempt"
+
+        # key (shared secret) storage method: ldap, ad, or datagroup
+        set static::ga_key_storage "datagroup"
+
+        # LDAP attribute for key if storing in LDAP (optional)
+        set static::ga_key_ldap_attr "google_auth_key"
+
+        # Active Directory attribute for key if storing in AD (optional)
+        set static::ga_key_ad_attr "google_auth_key"
+
+        # datagroup name if storing key in a datagroup (optional)
+        set static::ga_key_dg "google_auth_keys"
+
+
+        #####################################
+        ### DO NOT MODIFY BELOW THIS LINE ###
+        #####################################
+
+        # set lockout table
+        set static::lockout_state_table "[virtual name]_lockout_status"
+
+        # set variables from APM logon page
+        set username [ACCESS::session data get session.logon.last.username]
+        set ga_code_attempt [ACCESS::session data get session.logon.last.$static::ga_code_form_field] 
+
+        # retrieve key from specified storage
+        set ga_key ""
+
+        switch $static::ga_key_storage {
+            ldap {
+                set ga_key [ACCESS::session data get session.ldap.last.attr.$static::ga_key_ldap_attr]
+            }
+            ad {
+                set ga_key [ACCESS::session data get session.ad.last.attr.$static::ga_key_ad_attr]
+            }
+            datagroup {
+                set ga_key [class lookup $username $static::ga_key_dg]
+            }
+        }
+
+        # increment the number of login attempts for the user
+        set prev_attempts [table incr -notouch -subtable $static::lockout_state_table $username]
+        table timeout -subtable $static::lockout_state_table $username $static::lockout_period
+
+        # verification result value: 
+        # 0 = successful
+        # 1 = failed
+        # 2 = no key found
+        # 3 = invalid key length
+        # 4 = user locked out
+
+        # make sure that the user isn't locked out before calculating GA code
+        if { $prev_attempts <= $static::lockout_attempts } {
+
+            # check that a valid key was retrieved, then proceed
+            if { [string length $ga_key] == 16 } {
+                # begin - Base32 decode to binary
+
+                # Base32 alphabet (see RFC 4648)
+                array set static::b32_alphabet {
+                    A 0  B 1  C 2  D 3
+                    E 4  F 5  G 6  H 7
+                    I 8  J 9  K 10 L 11
+                    M 12 N 13 O 14 P 15
+                    Q 16 R 17 S 18 T 19
+                    U 20 V 21 W 22 X 23
+                    Y 24 Z 25 2 26 3 27
+                    4 28 5 29 6 30 7 31
+                }
+
+                set ga_key [string toupper $ga_key]
+                set l [string length $ga_key]
+                set n 0
+                set j 0
+                set ga_key_bin ""
+
+                for { set i 0 } { $i < $l } { incr i } {
+                    set n [expr $n << 5]
+                    set n [expr $n + $static::b32_alphabet([string index $ga_key $i])]
+                    set j [incr j 5]
+
+                    if { $j >= 8 } {
+                        set j [incr j -8]
+                        append ga_key_bin [format %c [expr ($n & (0xFF << $j)) >> $j]]
+                    }
+                }
+
+                # end - Base32 decode to binary
+
+                # begin - HMAC-SHA1 calculation of Google Auth token
+
+                set time [binary format W* [expr [clock seconds] / 30]]
+
+                set ipad ""
+                set opad ""
+
+                for { set j 0 } { $j < [string length $ga_key_bin] } { incr j } {
+                    binary scan $ga_key_bin @${j}H2 k
+                    set o [expr 0x$k ^ 0x5C]
+                    set i [expr 0x$k ^ 0x36]
+                    append ipad [format %c $i]
+                    append opad [format %c $o]
+                }
+
+                while { $j < 64 } {
+                    append ipad 6
+                    append opad \\
+                    incr j
+                }
+
+                binary scan [sha1 $opad[sha1 ${ipad}${time}]] H* token
+
+                # end - HMAC-SHA1 calculation of Google Auth hex token
+
+                # begin - extract code from Google Auth hex token
+
+                set offset [expr ([scan [string index $token end] %x] & 0x0F) << 1]
+                set ga_code [expr (0x[string range $token $offset [expr $offset + 7]] & 0x7FFFFFFF) % 1000000]
+                set ga_code [format %06d $ga_code]
+
+                # end - extract code from Google Auth hex token
+
+                if { $ga_code_attempt eq $ga_code } {
+                    # code verification successful
+                    set ga_result 0
+                } else {
+                    # code verification failed
+                    set ga_result 1
+                }
+            } elseif { [string length $ga_key] > 0 } {
+                # invalid key length, greater than 0, but not length not equal to 16 chars
+                set ga_result 3
+            } else {
+                # could not retrieve user's key
+                set ga_result 2
+            }
+        } else {
+            # user locked out due to too many failed attempts
+            set ga_result 4
+        }
+
+        # set code verification result in session variable
+        ACCESS::session data set session.custom.ga_result $ga_result
+    }
+}
